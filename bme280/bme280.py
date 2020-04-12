@@ -1,10 +1,14 @@
+#!/usr/bin/env python
 from enum import IntEnum
+import ctypes
+import smbus
+import click
 
 class Device(IntEnum):
     ADDRESS = 0x76  # ???
     ID = 0x60
 
-class Register(IntEnum):  
+class Register(IntEnum):
     ID = 0xd0
     RESET = 0xe0
     CTRL_HUM = 0xf2
@@ -14,7 +18,7 @@ class Register(IntEnum):
     CALIB_00 = 0x88
     CALIB_25 = 0xa1
     CALIB_26 = 0xe1
-    CALIB_41 = 0xf0
+    CALIB_34 = 0xe7
     HUM_LSB = 0xfe
     HUM_MSB = 0xfd
     TEMP_XLSB = 0xfc
@@ -31,6 +35,8 @@ class Ctrl_hum(IntEnum):
     OVERSAMPLING_4 = 0b011
     OVERSAMPLING_8 = 0b100
     OVERSAMPLING_16 = 0b101
+
+    WEATHER_PROFILE = OVERSAMPLING_1
 
 class Status(IntEnum):
     MEASURING = 0b1000
@@ -55,6 +61,10 @@ class Ctrl_meas(IntEnum):
     FORCED = 0b01
     NORMAL = 0b11
 
+    WEATHER_PROFILE = PRESSURE_OVERSAMPLING_1 | \
+                      TEMPERATURE_OVERSAMPLING_1 | \
+                      FORCED
+
 class Config(IntEnum):
     _t_sb_offset = 6
     _filter_offset = 2
@@ -74,3 +84,105 @@ class Config(IntEnum):
     SPI_ENABLE = 0b1
     SPI_DISABLE = 0b0
 
+    WEATHER_PROFILE = FILTER_OFF
+
+class NotSupportedDevice(Exception):
+    pass
+
+class Bme280(object):
+
+    PROFILE = {
+        'weather': {
+            Register.CONFIG: Config.FILTER_OFF,
+            Register.CTRL_MEAS: Ctrl_meas.FORCED | \
+                                Ctrl_meas.PRESSURE_OVERSAMPLING_1 | \
+                                Ctrl_meas.TEMPERATURE_OVERSAMPLING_1,
+            Register.CTRL_HUM: Ctrl_hum.OVERSAMPLING_1
+        }
+    }
+
+    def __init__(self, bus_addr, addr, profile='weather'):
+        self.bus = smbus.SMBus(bus_addr)
+        self.addr = addr
+        self.profile = profile
+        self._check_device_id()
+        self._setup_readings()
+        self.calib = self._get_calibration_data()
+
+
+    def _setup_readings(self):
+        for addr, value in self.PROFILE[self.profile].items():
+            self.bus.write_byte_data(self.addr, addr, value)
+
+    def _check_device_id(self):
+        device_id = self.bus.read_byte_data(self.addr, Register.ID)
+        if device_id != Device.ID:
+            raise NotSupportedDevice(f"Device ID mismatch: {device_id} != {Device.ID}")
+
+    def _get_calibration_data(self):
+        data = self.bus.read_i2c_block_data(self.addr, Register.CALIB_00, 26) + \
+            self.bus.read_i2c_block_data(self.addr, Register.CALIB_26, 8)
+
+        result = {}
+        idx = 0
+        for key in ['T1', 'T2', 'T3', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'P9']:
+            result[key] = data[idx] | data[idx + 1] << 8
+            idx += 2
+        result['H1'] = data[26]
+        result['H2'] = data[27] | data[28] << 8
+        result['H3'] = data[29]
+        result['H4'] = data[30] << 4 | data[31]
+        result['H5'] = data[31] >> 4 | data[32] << 4
+        result['H6'] = data[33]
+
+        return result
+
+    def compensate_temperature(self, value):
+        t1 = (value / 16384 - self.calib['T1'] / 1024) * self.calib['T2']
+        t2 = (value / 131072 - self.calib['T1'] / 8192) ** 2 * self.calib['T3']
+        self.t_fine = t1 + t2
+        return self.t_fine / 5120
+
+    def compensate_pressure(self, value):
+        t1 = (self.t_fine / 2) - 64000
+        t2 = t1 ** 2 * self.calib['P6'] / 32768
+        t2 += t1 * self.calib['P5'] * 2
+        t2 = (t2 / 4) + self.calib['P4'] * 65536
+        t1 = self.calib['P3'] * t1 ** 2 / 524288 + self.calib['P2'] * t1 / 524288
+        t1 = (1 + t1 / 32768) * self.calib['P1']
+        if t1 == 0:
+            return 0
+
+        p = 1048576 - value
+        p = (p - (t2 / 4096)) * 6250 / t1
+        t1 = self.calib['P9'] * p ** 2 / 2147483648
+        t2 = p * self.calib['P8'] / 32768
+        p = p + (t1 + t2 + self.calib['P7']) / 16
+        return p
+
+    def get_readings(self):
+        data = self.bus.read_i2c_block_data(self.addr, Register.PRESS_MSB, 8)
+        temperature = self.compensate_temperature(
+            data[3] << 12 | data[4] << 4 | data[5] >> 4) # order matters - first compensate temp
+        pressure = self.compensate_pressure(
+            data[0] << 12 | data[1] << 4 | data[2] >> 4)
+        humidity = data[6] << 8 | data[7]
+
+        return {"readings": f"temp: {temperature}, pressure: {pressure}, humidity: {humidity}",
+                "calibration": self.calib,
+                "temp": data[0:3]}
+
+
+
+def connect(bus=1, addr=Device.ADDRESS):
+    return Bme280(bus, addr)
+
+@click.command()
+def main():
+    """Simple app to read data from BME280 sensor"""
+    dev = connect()
+    result = dev.get_readings()
+    print(f"Result: {result}")
+
+if __name__ == '__main__':
+    main()
