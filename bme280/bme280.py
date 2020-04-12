@@ -123,24 +123,33 @@ class Bme280(object):
         data = self.bus.read_i2c_block_data(self.addr, Register.CALIB_00, 26) + \
             self.bus.read_i2c_block_data(self.addr, Register.CALIB_26, 8)
 
-        result = {}
-        idx = 0
-        for key in ['T1', 'T2', 'T3', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'P9']:
-            result[key] = data[idx] | data[idx + 1] << 8
-            idx += 2
-        result['H1'] = data[26]
-        result['H2'] = data[27] | data[28] << 8
-        result['H3'] = data[29]
-        result['H4'] = data[30] << 4 | data[31]
-        result['H5'] = data[31] >> 4 | data[32] << 4
-        result['H6'] = data[33]
+        result = {
+            'T1': ctypes.c_ushort(data[0] | data[1] << 8).value,
+            'T2': ctypes.c_short(data[2] | data[3] << 8).value,
+            'T3': ctypes.c_short(data[4] | data[5] << 8).value,
+            'P1': ctypes.c_ushort(data[6] | data[7] << 8).value,
+            'P2': ctypes.c_short(data[8] | data[9] << 8).value,
+            'P3': ctypes.c_short(data[10] | data[11] << 8).value,
+            'P4': ctypes.c_short(data[12] | data[13] << 8).value,
+            'P5': ctypes.c_short(data[14] | data[15] << 8).value,
+            'P6': ctypes.c_short(data[16] | data[17] << 8).value,
+            'P7': ctypes.c_short(data[18] | data[19] << 8).value,
+            'P8': ctypes.c_short(data[20] | data[21] << 8).value,
+            'P9': ctypes.c_short(data[22] | data[23] << 8).value,
+            'H1': ctypes.c_ushort(data[26]).value,
+            'H2': ctypes.c_short(data[27] | data[28] << 8).value,
+            'H3': ctypes.c_ubyte(data[29]).value,
+            'H4': ctypes.c_short(data[30] << 4| data[31]).value,
+            'H5': ctypes.c_short(data[31] >> 4| data[32] << 4).value,
+            'H6': ctypes.c_byte(data[33]).value
+        }
 
         return result
 
     def compensate_temperature(self, value):
-        t1 = (value / 16384 - self.calib['T1'] / 1024) * self.calib['T2']
-        t2 = (value / 131072 - self.calib['T1'] / 8192) ** 2 * self.calib['T3']
-        self.t_fine = t1 + t2
+        v1 = (value / 16384 - self.calib['T1'] / 1024) * self.calib['T2']
+        v2 = (value / 131072 - self.calib['T1'] / 8192) ** 2 * self.calib['T3']
+        self.t_fine = int(v1 + v2)
         return self.t_fine / 5120
 
     def compensate_pressure(self, value):
@@ -160,13 +169,25 @@ class Bme280(object):
         p = p + (t1 + t2 + self.calib['P7']) / 16
         return p
 
+    def compensate_humidity(self, value):
+        h = self.t_fine - 76800
+        h = (value - (self.calib['H4'] * 64 + self.calib['H5'] / 16384 * h)) * \
+            (self.calib['H2'] / 65536) * (1 + self.calib['H6'] / 67108864 * h * (1 + self.calib['H3'] / 67108864 * h))
+        h = h * (1 - self.calib['H1'] * h / 524288)
+
+        if h > 100:
+            return 100
+        if h < 0:
+            return 0
+        return h
+
     def get_readings(self):
         data = self.bus.read_i2c_block_data(self.addr, Register.PRESS_MSB, 8)
         temperature = self.compensate_temperature(
             data[3] << 12 | data[4] << 4 | data[5] >> 4) # order matters - first compensate temp
         pressure = self.compensate_pressure(
             data[0] << 12 | data[1] << 4 | data[2] >> 4)
-        humidity = data[6] << 8 | data[7]
+        humidity = self.compensate_humidity(data[6] << 8 | data[7])
 
         return {"readings": f"temp: {temperature}, pressure: {pressure}, humidity: {humidity}",
                 "calibration": self.calib,
