@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 from enum import IntEnum
-import ctypes
+import math
+from datetime import datetime
+from time import sleep
+import struct
 import smbus
 import click
 
@@ -16,9 +19,7 @@ class Register(IntEnum):
     CONFIG = 0xf5
     STATUS = 0xf3
     CALIB_00 = 0x88
-    CALIB_25 = 0xa1
     CALIB_26 = 0xe1
-    CALIB_34 = 0xe7
     HUM_LSB = 0xfe
     HUM_MSB = 0xfd
     TEMP_XLSB = 0xfc
@@ -35,8 +36,6 @@ class Ctrl_hum(IntEnum):
     OVERSAMPLING_4 = 0b011
     OVERSAMPLING_8 = 0b100
     OVERSAMPLING_16 = 0b101
-
-    WEATHER_PROFILE = OVERSAMPLING_1
 
 class Status(IntEnum):
     MEASURING = 0b1000
@@ -61,10 +60,6 @@ class Ctrl_meas(IntEnum):
     FORCED = 0b01
     NORMAL = 0b11
 
-    WEATHER_PROFILE = PRESSURE_OVERSAMPLING_1 | \
-                      TEMPERATURE_OVERSAMPLING_1 | \
-                      FORCED
-
 class Config(IntEnum):
     _t_sb_offset = 6
     _filter_offset = 2
@@ -84,115 +79,171 @@ class Config(IntEnum):
     SPI_ENABLE = 0b1
     SPI_DISABLE = 0b0
 
-    WEATHER_PROFILE = FILTER_OFF
-
 class NotSupportedDevice(Exception):
     pass
 
+class AttributeDict(dict):
+    __getattr__ = dict.__getitem__
+    __setattr__ = dict.__setitem__
+
 class Bme280(object):
+
+    MAX_HUMIDITY = 100
+    MIN_HUMIDITY = 0
 
     PROFILE = {
         'weather': {
             Register.CONFIG: Config.FILTER_OFF,
             Register.CTRL_MEAS: Ctrl_meas.FORCED | \
-                                Ctrl_meas.PRESSURE_OVERSAMPLING_1 | \
+                                Ctrl_meas.PRESSURE_OVERSAMPLING_16 | \
                                 Ctrl_meas.TEMPERATURE_OVERSAMPLING_1,
             Register.CTRL_HUM: Ctrl_hum.OVERSAMPLING_1
         }
     }
 
-    def __init__(self, bus_addr, addr, profile='weather'):
+    def __init__(self, bus_addr, addr, altitude = 217, profile='weather'):
         self.bus = smbus.SMBus(bus_addr)
         self.addr = addr
         self.profile = profile
         self._check_device_id()
+        self._last_read = datetime.now()
+        self.update_period = 1
         self._setup_readings()
-        self.calib = self._get_calibration_data()
+        self._get_calibration_data()
+        self._temperature = None
+        self._pressure = None
+        self._humidity = None
+        self.altitude = altitude
 
+    @property
+    def temperature(self):
+        """The compensated temperature in degrees celsius."""
+        self._get_readings()
+        return self._temperature
+
+    @property
+    def pressure(self):
+        """The compensated pressure in hPa."""
+        self._get_readings()
+        return self._pressure
+
+    @property
+    def humidity(self):
+        """The compensated humidity in %."""
+        self._get_readings()
+        return self._humidity
+
+    @property
+    def sea_level_pressure(self):
+        """The Sea Level calculates pressure."""
+        self._get_readings()
+        sea_level = self._pressure * \
+            math.pow(
+                (1 - (0.0065 * self.altitude) / (self._temperature + 0.0065 * self.altitude + 273.15)),
+                -5.257)
+        return sea_level
 
     def _setup_readings(self):
         for addr, value in self.PROFILE[self.profile].items():
             self.bus.write_byte_data(self.addr, addr, value)
+        sleep(0.002)
 
     def _check_device_id(self):
         device_id = self.bus.read_byte_data(self.addr, Register.ID)
         if device_id != Device.ID:
-            raise NotSupportedDevice(f"Device ID mismatch: {device_id} != {Device.ID}")
+            raise NotSupportedDevice(f"Device ID mismatch, found: {device_id}")
 
     def _get_calibration_data(self):
+        # Read 25 bytes and 7 bytes with calibration coefficients
+        # 25th byte is not used
         data = self.bus.read_i2c_block_data(self.addr, Register.CALIB_00, 26) + \
-            self.bus.read_i2c_block_data(self.addr, Register.CALIB_26, 8)
+            self.bus.read_i2c_block_data(self.addr, Register.CALIB_26, 7)
 
-        result = {
-            'T1': ctypes.c_ushort(data[0] | data[1] << 8).value,
-            'T2': ctypes.c_short(data[2] | data[3] << 8).value,
-            'T3': ctypes.c_short(data[4] | data[5] << 8).value,
-            'P1': ctypes.c_ushort(data[6] | data[7] << 8).value,
-            'P2': ctypes.c_short(data[8] | data[9] << 8).value,
-            'P3': ctypes.c_short(data[10] | data[11] << 8).value,
-            'P4': ctypes.c_short(data[12] | data[13] << 8).value,
-            'P5': ctypes.c_short(data[14] | data[15] << 8).value,
-            'P6': ctypes.c_short(data[16] | data[17] << 8).value,
-            'P7': ctypes.c_short(data[18] | data[19] << 8).value,
-            'P8': ctypes.c_short(data[20] | data[21] << 8).value,
-            'P9': ctypes.c_short(data[22] | data[23] << 8).value,
-            'H1': ctypes.c_ushort(data[26]).value,
-            'H2': ctypes.c_short(data[27] | data[28] << 8).value,
-            'H3': ctypes.c_ubyte(data[29]).value,
-            'H4': ctypes.c_short(data[30] << 4| data[31]).value,
-            'H5': ctypes.c_short(data[31] >> 4| data[32] << 4).value,
-            'H6': ctypes.c_byte(data[33]).value
+        coeff_map = {
+            'temperature': {
+                'prefix': 'T',
+                'data': data[0:6],
+                'structure': '<Hhh'   # see struct.unpack() format string
+            },
+            'pressure': {
+                'prefix': 'P',
+                'data': data[6:24],
+                'structure': '<Hhhhhhhhh'
+            },
+            'humidity': {
+                'prefix': 'H',
+                'data': data[25:],
+                'structure': '<BhBBhb'   # need some tricks here later on
+            }
         }
+        coeffs = AttributeDict()
+        for key, conf in coeff_map.items():
+            registers = list(struct.unpack(conf['structure'], bytes(conf['data'])))
+            for idx, value in enumerate(registers, start=1):
+                coeffs[f"{conf['prefix']}{idx}"] = value
 
-        return result
+        # Some weird number notation from BME280 docs to solve:
+        #
+        # 0xE4 / 0xE5[3:0] | dig_H4 [11:4] / [3:0] | signed short
+        # 0xE5[7:4] / 0xE6 | dig_H5 [3:0] / [11:4] | signed short
+        coeffs.H4 = (coeffs.H4 << 4 | coeffs.H5 & 0xF)  # 4 LSBs from next byte
+        coeffs.H5 = coeffs.H5 >> 4
+
+        self.coeffs = coeffs
+        return coeffs
 
     def compensate_temperature(self, value):
-        v1 = (value / 16384 - self.calib['T1'] / 1024) * self.calib['T2']
-        v2 = (value / 131072 - self.calib['T1'] / 8192) ** 2 * self.calib['T3']
-        self.t_fine = int(v1 + v2)
-        return self.t_fine / 5120
+        var1 = (value / 16384 - self.coeffs.T1 / 1024) * self.coeffs.T2
+        var2 = (value / 131072 - self.coeffs.T1 / 8192) * \
+             (value / 131072 - self.coeffs.T1 / 8192) * self.coeffs.T3
+        self._t_fine = int(var1 + var2)
+        return self._t_fine / 5120
 
     def compensate_pressure(self, value):
-        t1 = (self.t_fine / 2) - 64000
-        t2 = t1 ** 2 * self.calib['P6'] / 32768
-        t2 += t1 * self.calib['P5'] * 2
-        t2 = (t2 / 4) + self.calib['P4'] * 65536
-        t1 = self.calib['P3'] * t1 ** 2 / 524288 + self.calib['P2'] * t1 / 524288
-        t1 = (1 + t1 / 32768) * self.calib['P1']
-        if t1 == 0:
+        var1 = self._t_fine / 2 - 64000
+        var2 = var1 * var1 * self.coeffs.P6 / 32768
+        var2 = var2 + var1 * self.coeffs.P5 * 2
+        var2 = var2 / 4 + self.coeffs.P4 * 65536
+        var3 = self.coeffs.P3 * var1 * var1 / 524288
+        var1 = (var3 + self.coeffs['P2'] * var1) / 524288
+        var1 = (1 + var1 / 32768) * self.coeffs.P1
+        if not var1:
             return 0
 
-        p = 1048576 - value
-        p = (p - (t2 / 4096)) * 6250 / t1
-        t1 = self.calib['P9'] * p ** 2 / 2147483648
-        t2 = p * self.calib['P8'] / 32768
-        p = p + (t1 + t2 + self.calib['P7']) / 16
-        return p
+        pressure = 1048576 - value
+        pressure = (pressure - var2 / 4096) * 6250 / var1
+        var1 = self.coeffs.P9 * pressure * pressure / 2147483648
+        var2 = pressure * self.coeffs.P8 / 32768
+        pressure = pressure + (var1 + var2 + self.coeffs.P7) / 16
+        return pressure / 100
 
     def compensate_humidity(self, value):
-        h = self.t_fine - 76800
-        h = (value - (self.calib['H4'] * 64 + self.calib['H5'] / 16384 * h)) * \
-            (self.calib['H2'] / 65536) * (1 + self.calib['H6'] / 67108864 * h * (1 + self.calib['H3'] / 67108864 * h))
-        h = h * (1 - self.calib['H1'] * h / 524288)
+        h = self._t_fine - 76800
+        h = (value - (self.coeffs.H4 * 64 + self.coeffs.H5 / 16384 * h)) * \
+            (self.coeffs.H2 / 65536) * (1 + self.coeffs.H6 / 67108864 * h * \
+                (1 + self.coeffs.H3 / 67108864 * h))
+        h = h * (1 - self.coeffs.H1 * h / 524288)
 
-        if h > 100:
-            return 100
-        if h < 0:
-            return 0
+        if h > Bme280.MAX_HUMIDITY:
+            return Bme280.MAX_HUMIDITY
+        if h < Bme280.MIN_HUMIDITY:
+            return Bme280.MIN_HUMIDITY
+
         return h
 
-    def get_readings(self):
+    def _get_readings(self):
+        now = datetime.now()
+        if self._temperature and ((now - self._last_read).total_seconds() < self.update_period):
+            return
+
         data = self.bus.read_i2c_block_data(self.addr, Register.PRESS_MSB, 8)
-        temperature = self.compensate_temperature(
+        self._temperature = self.compensate_temperature(
             data[3] << 12 | data[4] << 4 | data[5] >> 4) # order matters - first compensate temp
-        pressure = self.compensate_pressure(
+        self._pressure = self.compensate_pressure(
             data[0] << 12 | data[1] << 4 | data[2] >> 4)
-        humidity = self.compensate_humidity(data[6] << 8 | data[7])
+        self._humidity = self.compensate_humidity(data[6] << 8 | data[7])
 
-        return {"readings": f"temp: {temperature}, pressure: {pressure}, humidity: {humidity}",
-                "calibration": self.calib,
-                "temp": data[0:3]}
-
+        self._last_read = now
 
 
 def connect(bus=1, addr=Device.ADDRESS):
@@ -202,8 +253,9 @@ def connect(bus=1, addr=Device.ADDRESS):
 def main():
     """Simple app to read data from BME280 sensor"""
     dev = connect()
-    result = dev.get_readings()
-    print(f"Result: {result}")
+    print(f"Temperature: {dev.temperature:.1f} C")
+    print(f"Pressure: {dev.pressure:.1f} [absolute] / {dev.sea_level_pressure:.1f} [sea level] hPa")
+    print(f"Humidity: {dev.humidity:3.1f} %")
 
 if __name__ == '__main__':
     main()
